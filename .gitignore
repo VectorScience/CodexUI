@@ -1,0 +1,41 @@
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+target/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.key
+*.cer
+*.crt
+*.mobileprovision
+AuthKey_*.p8
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+
+# Logs, tests and temporary files
+*.log
+*.tmp
+*.temp
+coverage/
+
+# Local Codex files
+.codex/
+.agents/
