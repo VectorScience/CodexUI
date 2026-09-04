@@ -1,6 +1,6 @@
 [package]
 name = "codex-ui"
-version = "0.1.0"
+version = "0.1.1"
 description = "ChatGPT Desktop wallpaper switcher"
 authors = ["CodexUI"]
 edition = "2021"
