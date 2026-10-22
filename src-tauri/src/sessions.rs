@@ -813,7 +813,7 @@ fn register(home: &Path, id: &str, path: &str, cwd: &str, title: &str) -> Result
         request(
             1,
             "initialize",
-            json!({"clientInfo":{"name":"codexui","version":"0.1.1"},"capabilities":{"experimentalApi":true}}),
+            json!({"clientInfo":{"name":"codexui","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}),
         )?;
         let response = request(
             2,

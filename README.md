@@ -20,6 +20,10 @@ CodexUI 是一款轻量、开源的 ChatGPT/Codex Desktop 本地增强工具，�
 
 ## 功能
 
+### v0.2.0：换一台电脑，继续原来的 Codex 上下文
+
+右键会话「同步到目录」→ 同步软件 → 另一台电脑「导入会话」。自动处理 UUID、日期目录、项目路径与分页历史依赖，带走整段工作上下文。**已由用户手动完成一次真实跨电脑迁移并确认成功。** 查看 [完整更新日志](CHANGELOG.md)。
+
 - 自动发现并启动官方 ChatGPT/Codex Desktop
 - 通过本机 CDP 连接桌面客户端
 - 导入、预览、切换、删除和取消壁纸
@@ -84,7 +88,7 @@ pnpm tauri build
 
 ## 发布
 
-推送形如 `v0.1.0` 的标签后，[GitHub Actions](.github/workflows/release.yml) 会自动创建 Release，并并行构建 Windows x64、macOS Apple Silicon 和 macOS Intel 安装包。应用版本应先在 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml` 和 `package.json` 中保持一致。
+推送形如 `v0.2.0` 的标签后，[GitHub Actions](.github/workflows/release.yml) 会自动从 `CHANGELOG.md` 提取该版本的更新说明，并行构建 Windows x64、macOS Apple Silicon 和 macOS Intel 安装包。三路构建全部成功且安装包齐全后自动公开 Release；失败时保留为草稿。应用版本应先在 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 和 `package.json` 中保持一致，标签必须对应相同版本与提交。
 
 默认构建不需要自定义密钥，只使用 GitHub 自动提供的 `GITHUB_TOKEN`。面向最终用户正式分发时，建议配置代码签名，详见 [发布签名说明](docs/CODE_SIGNING.md)。
 

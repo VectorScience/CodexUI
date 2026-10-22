@@ -47,7 +47,7 @@ codex-session-<源会话 UUID>/
 
 若本机没有兼容 CLI，或注册超时、登录与环境配置使恢复失败，文件和收据仍保留，界面会明确显示「文件已导入、注册未完成」，并给出 `codex resume <新 UUID>` 的恢复入口。不会把该状态报告为完整成功。
 
-协议依据：[官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)。`thread/resume.path` 是实验性字段；桌面菜单也是运行时 DOM 扩展，官方升级可能需要适配。当前实现结合本机生成的协议 schema 验证，隔离集成测试使用本机官方 CLI 实际注册分页会话并由第二个进程再次恢复。没有宣称已完成两台实体电脑、所有版本或 macOS 的端到端验收。
+协议依据：[官方 App Server 文档](https://learn.chatgpt.com/docs/app-server)。`thread/resume.path` 是实验性字段；桌面菜单也是运行时 DOM 扩展，官方升级可能需要适配。当前实现结合本机生成的协议 schema 验证，隔离集成测试使用本机官方 CLI 实际注册分页会话并由第二个进程再次恢复。2026-10-23，用户另行手动完成了一次电脑 A 到另一台电脑的迁移，并确认成功。该反馈没有记录两台电脑的具体系统与版本，不能据此推断所有版本或 macOS 均已完成端到端验收。
 
 ## 验证
 
