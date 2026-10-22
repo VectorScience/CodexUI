@@ -4,7 +4,7 @@
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-6f62d9)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-CodexUI 是一款轻量、开源的 ChatGPT/Codex Desktop 壁纸管理器。它通过仅监听本机回环地址的 Chrome DevTools Protocol（CDP）向桌面客户端注入背景样式，不修改官方安装文件、应用签名或用户的原始图片。
+CodexUI 是一款轻量、开源的 ChatGPT/Codex Desktop 本地增强工具，支持壁纸管理和完整会话迁移。它通过仅监听本机回环地址的 Chrome DevTools Protocol（CDP）向桌面客户端注入背景样式和会话右键菜单，不修改官方安装文件、应用签名或用户的原始图片。
 
 > CodexUI 是社区项目，与 OpenAI 无隶属或背书关系。ChatGPT、Codex 和 OpenAI 是其各自所有者的商标。
 
@@ -27,6 +27,10 @@ CodexUI 是一款轻量、开源的 ChatGPT/Codex Desktop 壁纸管理器。它�
 - 将注入严格限制在主窗口，不影响宠物等透明置顶辅助窗口
 - 页面导航或重绘后自动恢复壁纸
 - 所有图片均保存在本地
+- 在 Codex 会话右键菜单中选择「同步到目录」「导入会话」
+- 每 15 秒将选定会话及分页历史依赖写入压缩快照，通过现有同步软件传到另一台电脑
+- 导入预览、本机项目目录映射、独立 UUID、历史字节偏移重算和完整性校验
+- CodexUI 内提供可搜索的本机会话列表、同步状态与停止同步入口
 
 ## 安装与使用
 
@@ -45,11 +49,22 @@ CodexUI 是一款轻量、开源的 ChatGPT/Codex Desktop 壁纸管理器。它�
 
 Windows 使用 `127.0.0.1:9335`。壁纸复制到 `%LOCALAPPDATA%\CodexUI\wallpapers`，原始图片不会被修改。
 
+### 跨电脑迁移会话
+
+1. 电脑 A：在 CodexUI 连接 Codex，点击「启用 Codex 右键菜单」，右键一个本机会话，选择「同步到目录」。也可直接在 CodexUI 的会话列表选择。
+2. 保持 CodexUI 运行，由你的同步软件同步生成的 `codex-session-UUID` 目录。
+3. 电脑 B：运行 CodexUI，右键会话或侧栏空白处选择「导入会话」，选中同步完成的 `codex-session-UUID` 目录。
+4. 选择电脑 B 上对应的项目目录，检查预览后导入。程序自动处理 UUID、日期目录、项目元数据、分页依赖和字节偏移，并通过本机 Codex app-server 注册会话。
+
+导入创建独立副本，保留对话、工具输出、历史指令和压缩上下文。项目源码及外部图片、文件、插件与运行环境需要单独同步。同步为单向快照，不会合并两台电脑上继续编辑的聊天。详细说明见 [会话迁移与兼容性](docs/SESSION_TRANSFER.md)。
+
 ## 安全与隐私
 
 - CDP 仅绑定 `127.0.0.1`，不会暴露到局域网。
 - 开启 CDP 时，同一系统用户下的其他本地程序理论上可以访问调试端口；请勿同时运行不可信软件。
-- CodexUI 不读取聊天内容、API Key、访问令牌或账户信息。
+- 壁纸功能不读取聊天内容；会话迁移会读取你选择的会话及其历史依赖，并将完整对话、工具输出和历史指令保存到所选目录。
+- 不复制 `auth.json`、API Key 配置、访问令牌或整个账户数据库；对话里原本存在的敏感内容会随历史一起迁移。请将迁移包视为私人数据。
+- 导入不直接编辑 Codex 的 SQLite 或全局项目配置，也不覆盖已有会话。
 - 仓库和 Actions workflow 不包含证书、密码或签名私钥。
 
 ## 本地开发
@@ -79,6 +94,8 @@ pnpm tauri build
 
 ```bash
 pnpm build
+pnpm test
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 

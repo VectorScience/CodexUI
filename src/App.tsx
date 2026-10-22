@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Check, ChevronDown, Globe2, ImageOff, ImagePlus, MonitorUp, Play, RefreshCw, SlidersHorizontal, Sparkles, Trash2, Wifi, WifiOff } from "lucide-react";
 import type { CdpStatus, Wallpaper } from "./types";
+import SessionTransfer from "./SessionTransfer";
 
 const EMPTY: CdpStatus = { running: false, connected: false, port: 9335, message: "正在检测运行环境…" };
 
@@ -138,6 +139,8 @@ export default function App() {
     </section>
 
     {error && <div className="error" role="alert"><strong>{t.failed}</strong><span>{error}</span></div>}
+
+    <SessionTransfer language={language} connected={status.connected} />
 
     <section className="appearance-panel" ref={controlsRef}>
       <div className="section-intro"><span><Sparkles size={16} /></span><div><h3>{t.appearance}</h3><p>{t.appearanceHint}</p></div></div>

@@ -10,6 +10,8 @@ use std::{
 };
 use tungstenite::{connect, Message};
 use uuid::Uuid;
+mod session_bridge;
+mod sessions;
 
 const CDP_PORT: u16 = 9335;
 
@@ -174,8 +176,16 @@ fn is_running() -> bool {
     false
 }
 fn targets() -> Result<Vec<Value>, String> {
-    reqwest::blocking::get(format!("http://127.0.0.1:{CDP_PORT}/json"))
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(format!("http://127.0.0.1:{CDP_PORT}/json"))
+        .send()
         .map_err(|_| "CDP 未响应".to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
         .json()
         .map_err(|e| e.to_string())
 }
@@ -499,8 +509,19 @@ pub fn run() {
             add_wallpapers,
             remove_wallpaper,
             apply_wallpaper,
-            clear_wallpaper
+            clear_wallpaper,
+            sessions::list_sessions,
+            sessions::sync_session,
+            sessions::preview_import,
+            sessions::import_session,
+            sessions::list_syncs,
+            sessions::remove_sync,
+            session_bridge::enable_session_menu
         ])
+        .setup(|app| {
+            sessions::start_sync_worker(app.handle().clone());
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running CodexUI");
 }
