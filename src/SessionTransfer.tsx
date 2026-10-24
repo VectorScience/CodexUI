@@ -6,10 +6,11 @@ import { FolderSync, FolderInput, MousePointer2, RefreshCw, X, Search } from "lu
 
 type Session = { id: string; title: string; cwd: string; timestamp: string };
 type Binding = { id: string; directory: string; lastError: string | null };
-type Preview = { title: string; sourceCwd: string; files: number; bytes: number; snapshot: string };
+type Preview = { title: string; sourceCwd: string; files: number; threads: number; agents: number; bytes: number; snapshot: string };
 type ImportResult = { id: string; path: string; registered: boolean; message: string };
 const COPY = {
   "zh-CN": {
+    threads: "会话", agents: "子 Agent",
     title: "会话同步与迁移", hint: "电脑 A 同步目录 → 同步软件 → 电脑 B 导入，继续完整上下文。",
     menu: "启用 Codex 右键菜单", import: "导入会话", refresh: "刷新", search: "搜索会话、项目路径或 UUID",
     sync: "同步到目录", stop: "停止同步", loading: "正在处理…", empty: "没有匹配的本机会话", select: "选择会话迁移包目录（codex-session-UUID）",
@@ -20,6 +21,7 @@ const COPY = {
     ready: "已同步，CodexUI 运行期间将持续更新：", stopped: "已停止自动同步，目录内的快照已保留。", importHint: "保留历史指令与消息，重新分配 UUID，并把项目元数据映射到所选目录。",
   },
   en: {
+    threads: "Threads", agents: "Sub-agents",
     title: "Session sync & transfer", hint: "Sync on computer A → your sync software → import on computer B and continue with context.",
     menu: "Enable Codex context menu", import: "Import session", refresh: "Refresh", search: "Search sessions, project paths or UUIDs",
     sync: "Sync to folder", stop: "Stop sync", loading: "Working…", empty: "No matching local sessions", select: "Choose a session package folder (codex-session-UUID)",
@@ -108,7 +110,7 @@ export default function SessionTransfer({ language, connected }: { language: "en
     <p className="session-help">{t.note}</p><p className="session-help">{t.privacy}</p>
     {pending && <dialog className="session-import-dialog" aria-labelledby="import-title" onCancel={e => { e.preventDefault(); if (!busy) setPending(null); }} ref={element => { if (element && !element.open) element.showModal(); }}>
       <h2 id="import-title">{t.preview}</h2><h3>{pending.preview.title}</h3>
-      <dl><dt>{t.source}</dt><dd>{pending.preview.sourceCwd}</dd><dt>{t.context}</dt><dd>{pending.preview.files} · {(pending.preview.bytes / 1024 / 1024).toFixed(2)} MiB</dd><dt>{t.destination}</dt><dd>{project || "—"}</dd></dl>
+      <dl><dt>{t.source}</dt><dd>{pending.preview.sourceCwd}</dd><dt>{t.threads}</dt><dd>{pending.preview.threads} · {pending.preview.agents} {t.agents}</dd><dt>{t.context}</dt><dd>{pending.preview.files} · {(pending.preview.bytes / 1024 / 1024).toFixed(2)} MiB</dd><dt>{t.destination}</dt><dd>{project || "—"}</dd></dl>
       <p>{t.importHint}</p><button className="button button-secondary" disabled={busy} onClick={() => action(async () => { const p = await pick(t.project); if (p) setProject(p); })}><FolderInput size={16} />{t.chooseProject}</button>
       <div className="actions"><button className="button button-quiet" disabled={busy} onClick={() => setPending(null)}>{t.cancel}</button><button className="button button-primary" disabled={busy || !project} onClick={doImport}>{busy ? t.loading : t.confirm}</button></div>
       {error && <p role="alert" className="session-warning">{error}</p>}

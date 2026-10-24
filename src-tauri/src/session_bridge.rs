@@ -176,7 +176,7 @@ fn handle(app: &tauri::AppHandle, request: &Value) -> Result<String, String> {
             else {
                 return Ok("已取消导入".into());
             };
-            let confirmed=app.dialog().message(format!("会话：{}\n来源项目：{}\n本机项目：{}\n包含 {} 个历史文件。导入将创建独立会话，并保留完整历史中的指令与内容。是否导入？",preview.title,preview.source_cwd,project,preview.files)).title("导入会话").buttons(MessageDialogButtons::OkCancel).blocking_show();
+            let confirmed=app.dialog().message(format!("会话：{}\n来源项目：{}\n本机项目：{}\n包含 {} 个会话（{} 个子 Agent）、{} 个历史文件。导入将创建独立副本，并保留完整历史中的指令与内容。是否导入？",preview.title,preview.source_cwd,project,preview.threads,preview.agents,preview.files)).title("导入会话").buttons(MessageDialogButtons::OkCancel).blocking_show();
             if !confirmed {
                 return Ok("已取消导入".into());
             }

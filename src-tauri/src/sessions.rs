@@ -42,6 +42,8 @@ struct Entry {
     file: String,
     sha256: String,
     bytes: usize,
+    #[serde(default)]
+    timestamp: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,14 +54,27 @@ struct Bundle {
     title: String,
     cwd: String,
     entries: Vec<Entry>,
+    /// Logical thread ID -> newest history page's storage ID (v2).
+    #[serde(default)]
+    threads: BTreeMap<String, String>,
 }
 type LoadedBundle = (Bundle, BTreeMap<String, Vec<u8>>, String);
+type ThreadHeads = (BTreeMap<String, String>, BTreeMap<String, Value>);
+struct Registration {
+    id: String,
+    path: String,
+    cwd: String,
+    title: String,
+    resume: bool,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub title: String,
     pub source_cwd: String,
     pub files: usize,
+    pub threads: usize,
+    pub agents: usize,
     pub bytes: usize,
     pub snapshot: String,
 }
@@ -128,6 +143,48 @@ fn metadata(bytes: &[u8]) -> Result<Value, String> {
     uuid(v["payload"]["id"].as_str().ok_or("缺少会话 ID")?)?;
     Ok(v["payload"].clone())
 }
+fn read_metadata(path: &Path) -> Result<Value, String> {
+    let f = fs::File::open(path).map_err(err)?;
+    let reader: Box<dyn Read> = if path.extension().is_some_and(|s| s == "zst") {
+        Box::new(zstd::stream::read::Decoder::new(f).map_err(err)?)
+    } else {
+        Box::new(f)
+    };
+    let mut line = String::new();
+    BufReader::new(reader.take(2 * 1024 * 1024))
+        .read_line(&mut line)
+        .map_err(err)?;
+    metadata(line.as_bytes())
+}
+fn agent_parent(m: &Value) -> Option<&str> {
+    m["source"]["subagent"]["thread_spawn"]["parent_thread_id"].as_str()
+}
+fn thread_links(m: &Value) -> Vec<String> {
+    [agent_parent(m), m["forked_from_id"].as_str()]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect()
+}
+/// Storage IDs identify history pages; session_meta.id identifies the logical thread.
+fn thread_heads(index: &BTreeMap<String, PathBuf>) -> Result<ThreadHeads, String> {
+    let mut heads: BTreeMap<String, String> = BTreeMap::new();
+    let mut metas = BTreeMap::new();
+    for (key, path) in index {
+        let Ok(m) = read_metadata(path) else {
+            continue;
+        };
+        let id = m["id"].as_str().ok_or("缺少会话 ID")?.to_string();
+        if heads
+            .get(&id)
+            .is_none_or(|old| index[old].file_name() < path.file_name())
+        {
+            heads.insert(id, key.clone());
+        }
+        metas.insert(key.clone(), m);
+    }
+    Ok((heads, metas))
+}
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -186,41 +243,35 @@ fn list_sessions_impl() -> Result<Vec<Session>, String> {
         }
     }
     let mut out = vec![];
-    for (id, p) in session_index(&home)? {
-        let meta = if p.extension().is_some_and(|s| s == "zst") {
-            read_limited(&p).and_then(|b| metadata(&b))
-        } else {
-            fs::File::open(&p).map_err(err).and_then(|f| {
-                let mut line = String::new();
-                BufReader::new(f)
-                    .take(2 * 1024 * 1024)
-                    .read_line(&mut line)
-                    .map_err(err)?;
-                metadata(line.as_bytes())
-            })
-        };
-        if let Ok(m) = meta {
-            out.push(Session {
-                title: titles.get(&id).cloned().unwrap_or_else(|| id.clone()),
-                id,
-                cwd: m["cwd"].as_str().unwrap_or("").into(),
-                timestamp: m["timestamp"].as_str().unwrap_or("").into(),
-                path: p.to_string_lossy().into(),
-            });
-        }
+    let index = session_index(&home)?;
+    let (heads, metas) = thread_heads(&index)?;
+    for (id, head) in heads {
+        let p = &index[&head];
+        let m = &metas[&head];
+        out.push(Session {
+            title: titles.get(&id).cloned().unwrap_or_else(|| id.clone()),
+            id,
+            cwd: m["cwd"].as_str().unwrap_or("").into(),
+            timestamp: m["timestamp"].as_str().unwrap_or("").into(),
+            path: p.to_string_lossy().into(),
+        });
     }
     out.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(out)
 }
 fn dependencies(m: &Value) -> Vec<String> {
-    [
-        m["history_base"]["thread_id"].as_str(),
-        m["forked_from_id"].as_str(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::to_owned)
-    .collect()
+    [m["history_base"]["thread_id"].as_str()]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect()
+}
+fn history_dependencies(values: &[Value]) -> BTreeSet<String> {
+    values
+        .iter()
+        .filter(|v| v["type"] == "session_meta")
+        .flat_map(|v| dependencies(&v["payload"]))
+        .collect()
 }
 fn collect(
     id: &str,
@@ -244,12 +295,9 @@ fn collect(
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         return Err("会话正在更新，请待当前轮次结束后重试".into());
     }
-    let m = metadata(&bytes)?;
-    if m["id"] != id {
-        return Err("会话文件与 UUID 不匹配".into());
-    }
-    records(&bytes)?;
-    for parent in dependencies(&m) {
+    metadata(&bytes)?;
+    let parents = history_dependencies(&records(&bytes)?);
+    for parent in parents {
         collect(&parent, index, visiting, out)?;
     }
     if out.iter().map(|(_, b)| b.len()).sum::<usize>() + bytes.len() > MAX_TOTAL {
@@ -278,12 +326,62 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 }
 fn export_to(home: &Path, id: &str, directory: &Path, title: &str) -> Result<String, String> {
     let index = session_index(home)?;
+    let (heads, metas) = thread_heads(&index)?;
+    let root_head = heads.get(id).ok_or("找不到源会话")?;
+    let mut selected = BTreeSet::from([id.to_string()]);
+    loop {
+        let mut next = selected.clone();
+        for thread in &selected {
+            let head = heads
+                .get(thread)
+                .ok_or_else(|| format!("缺少 Agent 关联会话 {thread}"))?;
+            next.extend(thread_links(&metas[head]));
+            let mut page = head.as_str();
+            let mut seen = BTreeSet::new();
+            while seen.insert(page.to_string()) {
+                let m = metas
+                    .get(page)
+                    .ok_or_else(|| format!("缺少历史依赖 {page}"))?;
+                next.insert(m["id"].as_str().unwrap().to_string());
+                next.extend(thread_links(m));
+                match m["history_base"]["thread_id"].as_str() {
+                    Some(base) => page = base,
+                    None => break,
+                }
+            }
+        }
+        for (thread, head) in &heads {
+            if agent_parent(&metas[head]).is_some_and(|p| selected.contains(p)) {
+                next.insert(thread.clone());
+            }
+        }
+        if next.len() > MAX_FILES {
+            return Err("Agent 关系图过大".into());
+        }
+        if next == selected {
+            break;
+        }
+        selected = next;
+    }
     let mut files = vec![];
-    collect(id, &index, &mut BTreeSet::new(), &mut files)?;
-    let m = metadata(&files.last().ok_or("空迁移包")?.1)?;
+    let threads: BTreeMap<_, _> = selected
+        .into_iter()
+        .map(|thread| {
+            let head = heads[&thread].clone();
+            (thread, head)
+        })
+        .collect();
+    let before = graph_fingerprint(&index, &threads)?;
+    for head in threads.values() {
+        collect(head, &index, &mut BTreeSet::new(), &mut files)?;
+    }
+    if before != graph_fingerprint(&session_index(home)?, &threads)? {
+        return Err("会话关系图正在更新，请待当前轮次结束后重试".into());
+    }
+    let m = &metas[root_head];
     let bundle = Bundle {
         format: "codexui-session".into(),
-        version: 1,
+        version: 2,
         root_id: id.into(),
         title: title.into(),
         cwd: m["cwd"].as_str().unwrap_or("").into(),
@@ -294,8 +392,16 @@ fn export_to(home: &Path, id: &str, directory: &Path, title: &str) -> Result<Str
                 file: format!("{id}.jsonl.zst"),
                 sha256: digest(b),
                 bytes: b.len(),
+                timestamp: index[id]
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .get(8..27)
+                    .unwrap_or("")
+                    .into(),
             })
             .collect(),
+        threads,
     };
     // Content-derived snapshots are immutable and safe for directory sync software.
     let manifest = serde_json::to_vec_pretty(&bundle).map_err(err)?;
@@ -419,8 +525,8 @@ fn load_bundle(directory: &Path) -> Result<LoadedBundle, String> {
     if digest(&manifest) != current {
         return Err("迁移包清单校验失败".into());
     }
-    let bundle: Bundle = serde_json::from_slice(&manifest).map_err(err)?;
-    if bundle.format != "codexui-session" || bundle.version != 1 {
+    let mut bundle: Bundle = serde_json::from_slice(&manifest).map_err(err)?;
+    if bundle.format != "codexui-session" || !(1..=2).contains(&bundle.version) {
         return Err("不支持的迁移包版本".into());
     }
     uuid(&bundle.root_id)?;
@@ -428,9 +534,20 @@ fn load_bundle(directory: &Path) -> Result<LoadedBundle, String> {
         return Err("迁移包文件数量无效".into());
     }
     let mut files = BTreeMap::new();
+    let mut history = BTreeMap::new();
     let mut size = 0;
     for entry in &bundle.entries {
         uuid(&entry.id)?;
+        if !entry.timestamp.is_empty()
+            && (entry.timestamp.len() != 19
+                || !entry.timestamp.bytes().enumerate().all(|(i, b)| match i {
+                    4 | 7 | 13 | 16 => b == b'-',
+                    10 => b == b'T',
+                    _ => b.is_ascii_digit(),
+                }))
+        {
+            return Err("无效历史页日期".into());
+        }
         if (entry.file != format!("{}.jsonl", entry.id)
             && entry.file != format!("{}.jsonl.zst", entry.id))
             || files.contains_key(&entry.id)
@@ -449,23 +566,73 @@ fn load_bundle(directory: &Path) -> Result<LoadedBundle, String> {
         if size > MAX_TOTAL || bytes.len() != entry.bytes || digest(&bytes) != entry.sha256 {
             return Err("迁移包不完整或内容校验失败，请等待同步结束".into());
         }
-        if metadata(&bytes)?["id"] != entry.id {
+        if bundle.version == 1 && metadata(&bytes)?["id"] != entry.id {
             return Err("清单与会话 ID 不匹配".into());
         }
-        records(&bytes)?;
+        metadata(&bytes)?;
+        history.insert(entry.id.clone(), history_dependencies(&records(&bytes)?));
         files.insert(entry.id.clone(), bytes);
     }
-    if !files.contains_key(&bundle.root_id) {
+    if bundle.version == 1 {
+        bundle.threads = files.keys().map(|id| (id.clone(), id.clone())).collect();
+    }
+    if !bundle.threads.contains_key(&bundle.root_id) {
         return Err("迁移包缺少根会话".into());
     }
-    for bytes in files.values() {
-        for dep in dependencies(&metadata(bytes)?) {
-            if !files.contains_key(&dep) {
+    for (thread, head) in &bundle.threads {
+        uuid(thread)?;
+        let m = metadata(files.get(head).ok_or("迁移包缺少会话末页")?)?;
+        if m["id"] != *thread {
+            return Err("会话末页 ID 不匹配".into());
+        }
+    }
+    for (key, bytes) in &files {
+        let m = metadata(bytes)?;
+        if !bundle.threads.contains_key(m["id"].as_str().unwrap()) {
+            return Err("历史页所属会话不在关系图中".into());
+        }
+        for dep in &history[key] {
+            if !files.contains_key(dep) {
                 return Err(format!("迁移包缺少依赖 {dep}"));
             }
         }
     }
+    registration_order(&bundle, &files)?;
     Ok((bundle, files, current))
+}
+fn registration_order(
+    bundle: &Bundle,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<String>, String> {
+    fn visit(
+        id: &str,
+        bundle: &Bundle,
+        files: &BTreeMap<String, Vec<u8>>,
+        visiting: &mut BTreeSet<String>,
+        done: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if done.iter().any(|s| s == id) {
+            return Ok(());
+        }
+        if !visiting.insert(id.into()) {
+            return Err("Agent 关联存在循环".into());
+        }
+        let head = bundle
+            .threads
+            .get(id)
+            .ok_or_else(|| format!("迁移包缺少 Agent 关联 {id}"))?;
+        for dep in thread_links(&metadata(&files[head])?) {
+            visit(&dep, bundle, files, visiting, done)?;
+        }
+        visiting.remove(id);
+        done.push(id.into());
+        Ok(())
+    }
+    let mut done = vec![];
+    for id in bundle.threads.keys() {
+        visit(id, bundle, files, &mut BTreeSet::new(), &mut done)?;
+    }
+    Ok(done)
 }
 #[tauri::command]
 pub async fn preview_import(directory: String) -> Result<Preview, String> {
@@ -475,10 +642,17 @@ pub async fn preview_import(directory: String) -> Result<Preview, String> {
 }
 pub fn preview_import_impl(directory: String) -> Result<Preview, String> {
     let (b, files, snapshot) = load_bundle(Path::new(&directory))?;
+    let agents = b
+        .threads
+        .values()
+        .filter(|head| metadata(&files[*head]).is_ok_and(|m| agent_parent(&m).is_some()))
+        .count();
     Ok(Preview {
         title: b.title,
         source_cwd: b.cwd,
         files: files.len(),
+        threads: b.threads.len(),
+        agents,
         bytes: files.values().map(Vec::len).sum(),
         snapshot,
     })
@@ -494,6 +668,7 @@ fn remap(
         Value::Object(map) => {
             for (key, v) in map {
                 if key == "thread_id"
+                    || key == "parent_thread_id"
                     || key == "forked_from_id"
                     || key == "session_id"
                     || (metadata_id && key == "id")
@@ -523,6 +698,50 @@ fn remap(
         _ => (),
     }
 }
+/// Update runtime links, without rewriting message text, encrypted content or historical tool output.
+fn remap_history_ids(value: &mut Value, ids: &BTreeMap<String, String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map {
+                if matches!(
+                    key.as_str(),
+                    "thread_id"
+                        | "threadId"
+                        | "session_id"
+                        | "sessionId"
+                        | "agent_thread_id"
+                        | "agentThreadId"
+                        | "parent_thread_id"
+                        | "parentThreadId"
+                        | "sender_thread_id"
+                        | "senderThreadId"
+                        | "receiver_thread_id"
+                        | "receiverThreadId"
+                ) {
+                    if let Some(new) = v.as_str().and_then(|id| ids.get(id)) {
+                        *v = json!(new);
+                    }
+                } else if matches!(key.as_str(), "receiver_thread_ids" | "receiverThreadIds") {
+                    if let Some(items) = v.as_array_mut() {
+                        for item in items {
+                            if let Some(new) = item.as_str().and_then(|id| ids.get(id)) {
+                                *item = json!(new);
+                            }
+                        }
+                    }
+                } else {
+                    remap_history_ids(v, ids);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                remap_history_ids(item, ids);
+            }
+        }
+        _ => (),
+    }
+}
 // Maps old newline boundaries to new UTF-8 byte offsets, including the metadata line.
 fn rebuild(
     id: &str,
@@ -540,32 +759,36 @@ fn rebuild(
     }
     let bytes = files.get(id).ok_or("历史依赖缺失")?;
     let m = metadata(bytes)?;
-    for dep in dependencies(&m) {
+    let mut values = records(bytes)?;
+    for dep in history_dependencies(&values) {
         rebuild(&dep, files, ids, cwd, visiting, built)?;
     }
-    let mut values = records(bytes)?;
-    if let Some(base) = values[0]["payload"].get_mut("history_base") {
-        let parent = base["thread_id"].as_str().ok_or("无效 history_base")?;
-        let offset = base["end_byte_offset"].as_u64().ok_or("缺少历史字节偏移")?;
-        let new_offset = built
-            .get(parent)
-            .and_then(|(_, map)| map.get(&offset))
-            .ok_or("历史字节偏移不在有效行边界，已停止导入")?;
-        let source = files.get(parent).ok_or("缺少历史源文件")?;
-        let prefix = source
-            .get(..usize::try_from(offset).map_err(err)?)
-            .ok_or("历史偏移超出源文件")?;
-        let expected = base["end_ordinal_exclusive"]
-            .as_u64()
-            .ok_or("缺少历史 ordinal")?;
-        let last = records(prefix)?
-            .last()
-            .and_then(|v| v["ordinal"].as_u64())
-            .and_then(|n| n.checked_add(1));
-        if last != Some(expected) {
-            return Err("历史 ordinal 与字节偏移不匹配".into());
+    // Forks can embed additional parent metadata after their own header.
+    // Every embedded history_base needs its own byte boundary adjustment.
+    for value in values.iter_mut().filter(|v| v["type"] == "session_meta") {
+        if let Some(base) = value["payload"].get_mut("history_base") {
+            let parent = base["thread_id"].as_str().ok_or("无效 history_base")?;
+            let offset = base["end_byte_offset"].as_u64().ok_or("缺少历史字节偏移")?;
+            let new_offset = built
+                .get(parent)
+                .and_then(|(_, map)| map.get(&offset))
+                .ok_or("历史字节偏移不在有效行边界，已停止导入")?;
+            let source = files.get(parent).ok_or("缺少历史源文件")?;
+            let prefix = source
+                .get(..usize::try_from(offset).map_err(err)?)
+                .ok_or("历史偏移超出源文件")?;
+            let expected = base["end_ordinal_exclusive"]
+                .as_u64()
+                .ok_or("缺少历史 ordinal")?;
+            let last = records(prefix)?
+                .last()
+                .and_then(|v| v["ordinal"].as_u64())
+                .and_then(|n| n.checked_add(1));
+            if last != Some(expected) {
+                return Err("历史 ordinal 与字节偏移不匹配".into());
+            }
+            base["end_byte_offset"] = json!(new_offset);
         }
-        base["end_byte_offset"] = json!(new_offset);
     }
     let old_cwd = m["cwd"].as_str().unwrap_or("");
     let mut out = vec![];
@@ -586,6 +809,8 @@ fn rebuild(
             }
         } else if v["type"] == "turn_context" {
             remap(&mut v["payload"], ids, old_cwd, cwd, false);
+        } else if v["type"] != "response_item" {
+            remap_history_ids(&mut v["payload"], ids);
         }
         serde_json::to_writer(&mut out, v).map_err(err)?;
         out.push(b'\n');
@@ -661,17 +886,15 @@ fn import_into(
     let cwd = display_path(&cwd);
     let ids: BTreeMap<_, _> = files
         .keys()
+        .chain(bundle.threads.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .map(|id| (id.clone(), Uuid::new_v4().to_string()))
         .collect();
     let mut built = BTreeMap::new();
-    rebuild(
-        &bundle.root_id,
-        &files,
-        &ids,
-        &cwd,
-        &mut BTreeSet::new(),
-        &mut built,
-    )?;
+    for key in files.keys() {
+        rebuild(key, &files, &ids, &cwd, &mut BTreeSet::new(), &mut built)?;
+    }
     // A journal is persisted before publishing. A crash leaves a reviewable list, never overwritten chats.
     let journal = imports.join(Uuid::new_v4().to_string());
     fs::create_dir_all(&journal).map_err(err)?;
@@ -679,11 +902,28 @@ fn import_into(
     for (old, (bytes, _)) in &built {
         let m = metadata(bytes)?;
         let date = date_path(&m)?;
-        let filename = format!(
-            "rollout-{}T00-00-00-{}.jsonl",
-            m["timestamp"].as_str().unwrap().get(..10).unwrap(),
-            ids[old]
-        );
+        let logical = metadata(&files[old])?["id"].as_str().unwrap().to_string();
+        let suffix = if logical == *old {
+            ids[old].clone()
+        } else {
+            format!("{}_{}", ids[&logical], ids[old])
+        };
+        let entry = bundle
+            .entries
+            .iter()
+            .find(|e| e.id == *old)
+            .ok_or("缺少历史页清单")?;
+        let stamp = if entry.timestamp.is_empty() {
+            m["timestamp"]
+                .as_str()
+                .unwrap()
+                .get(..19)
+                .ok_or("无效日期")?
+                .replace(':', "-")
+        } else {
+            entry.timestamp.clone()
+        };
+        let filename = format!("rollout-{}-{}.jsonl", stamp, suffix);
         let dest = home.join("sessions").join(date).join(filename);
         if dest.exists() {
             return Err("新 UUID 意外冲突，已停止导入".into());
@@ -691,7 +931,7 @@ fn import_into(
         destinations.insert(old.clone(), dest);
         atomic_write(&journal.join(format!("{}.jsonl", ids[old])), bytes)?;
     }
-    atomic_write(&journal.join("receipt.json"),&serde_json::to_vec_pretty(&json!({"source":directory,"snapshot":current,"ids":ids,"paths":destinations,"project":cwd})).map_err(err)?)?;
+    atomic_write(&journal.join("receipt.json"),&serde_json::to_vec_pretty(&json!({"source":directory,"snapshot":current,"ids":ids,"paths":destinations,"project":cwd,"threads":bundle.threads})).map_err(err)?)?;
     let mut published = vec![];
     let publish = (|| {
         for (old, dest) in &destinations {
@@ -715,10 +955,37 @@ fn import_into(
         return Err(e);
     }
     let id = ids[&bundle.root_id].clone();
-    let path = destinations[&bundle.root_id].to_string_lossy().to_string();
-    let registration = register(home, &id, &path, &cwd, &bundle.title);
+    let path = destinations[&bundle.threads[&bundle.root_id]]
+        .to_string_lossy()
+        .to_string();
+    let mut registrations = vec![];
+    let registration = (|| {
+        for thread in registration_order(&bundle, &files)? {
+            let head = &bundle.threads[&thread];
+            let meta = metadata(&files[head])?;
+            let name = if thread == bundle.root_id {
+                bundle.title.as_str()
+            } else {
+                meta["source"]["subagent"]["thread_spawn"]["agent_nickname"]
+                    .as_str()
+                    .unwrap_or("")
+            };
+            registrations.push(Registration {
+                id: ids[&thread].clone(),
+                path: display_path(&destinations[head]),
+                cwd: cwd.clone(),
+                title: name.to_string(),
+                resume: agent_parent(&meta).is_none(),
+            });
+        }
+        register_many(home, &registrations)?;
+        Ok::<_, String>(())
+    })();
+    atomic_write(&journal.join("registration.json"), &serde_json::to_vec_pretty(&json!({
+        "complete":registration.is_ok(),"threads":registrations.iter().map(|r| &r.id).collect::<Vec<_>>(),"total":bundle.threads.len(),"error":registration.as_ref().err()
+    })).map_err(err)?)?;
     let (registered,message) = match registration {
-        Ok(()) => (true,"导入完成，已通过 Codex app-server 注册。可在 Codex 会话列表中继续；列表未刷新时请重新打开 Codex。".into()),
+        Ok(()) => (true,format!("导入完成，{} 个会话已通过 Codex app-server 注册。可在 Codex 会话列表中继续；列表未刷新时请重新打开 Codex。",bundle.threads.len())),
         Err(e) => (false,format!("会话文件已安全导入，但 Codex 注册未完成：{e}。可在终端运行 codex resume {id}；导入记录：{}",journal.display()))
     };
     Ok(ImportResult {
@@ -763,7 +1030,23 @@ fn codex_executable() -> String {
     }
     "codex".into()
 }
-fn register(home: &Path, id: &str, path: &str, cwd: &str, title: &str) -> Result<(), String> {
+#[cfg(test)]
+fn register(home: &Path, id: &str, path: &str, cwd: &str, title: &str) -> Result<Value, String> {
+    register_many(
+        home,
+        &[Registration {
+            id: id.into(),
+            path: path.into(),
+            cwd: cwd.into(),
+            title: title.into(),
+            resume: true,
+        }],
+    )?
+    .into_iter()
+    .next()
+    .ok_or("未返回会话".into())
+}
+fn register_many(home: &Path, registrations: &[Registration]) -> Result<Vec<Value>, String> {
     let mut child = crate::hidden_command(&codex_executable())
         .args(["app-server", "--listen", "stdio://"])
         .env("CODEX_HOME", home)
@@ -815,18 +1098,51 @@ fn register(home: &Path, id: &str, path: &str, cwd: &str, title: &str) -> Result
             "initialize",
             json!({"clientInfo":{"name":"codexui","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}),
         )?;
-        let response = request(
-            2,
-            "thread/resume",
-            json!({"threadId":id,"path":path,"cwd":cwd,"excludeTurns":true}),
-        )?;
-        if response["thread"]["id"] != id {
-            return Err("Codex 返回了不同的会话 ID".into());
+        let mut threads = vec![];
+        for (i, registration) in registrations.iter().enumerate() {
+            let Registration {
+                id,
+                path,
+                cwd,
+                title,
+                resume,
+            } = registration;
+            let sequence = 2 + i as u64 * 3;
+            let response = request(
+                sequence,
+                if *resume {
+                    "thread/resume"
+                } else {
+                    "thread/read"
+                },
+                if *resume {
+                    json!({"threadId":id,"path":path,"cwd":cwd,"excludeTurns":true})
+                } else {
+                    json!({"threadId":id,"includeTurns":false})
+                },
+            )
+            .map_err(|e| format!("会话 {id} 注册失败：{e}"))?;
+            if response["thread"]["id"] != *id {
+                return Err("Codex 返回了不同的会话 ID".into());
+            }
+            if !title.is_empty() {
+                request(
+                    sequence + 1,
+                    "thread/name/set",
+                    json!({"threadId":id,"name":title}),
+                )?;
+            }
+            let persisted = request(
+                sequence + 2,
+                "thread/read",
+                json!({"threadId":id,"includeTurns":false}),
+            )?;
+            if persisted["thread"]["id"] != *id {
+                return Err("Codex 未能读取已注册会话".into());
+            }
+            threads.push(persisted["thread"].clone());
         }
-        if !title.is_empty() {
-            request(3, "thread/name/set", json!({"threadId":id,"name":title}))?;
-        }
-        Ok(())
+        Ok(threads)
     })();
     let _ = child.kill();
     let _ = child.wait();
@@ -928,6 +1244,8 @@ fn source_fingerprint(
     bundle: &Bundle,
 ) -> Result<String, String> {
     let mut hash = Sha256::new();
+    // Include new descendants without invalidating a snapshot for unrelated active chats.
+    hash.update(graph_fingerprint(index, &bundle.threads)?.as_bytes());
     for entry in &bundle.entries {
         let m = fs::metadata(index.get(&entry.id).ok_or("会话源文件缺失")?).map_err(err)?;
         hash.update(entry.id.as_bytes());
@@ -943,10 +1261,448 @@ fn source_fingerprint(
     }
     Ok(format!("{:x}", hash.finalize()))
 }
+fn graph_fingerprint(
+    index: &BTreeMap<String, PathBuf>,
+    threads: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut related = BTreeMap::new();
+    for (key, path) in index {
+        if let Ok(m) = read_metadata(path) {
+            if m["id"].as_str().is_some_and(|id| threads.contains_key(id))
+                || agent_parent(&m).is_some_and(|id| threads.contains_key(id))
+            {
+                if !threads.contains_key(m["id"].as_str().unwrap()) {
+                    return Err("Agent 关系图出现新会话，请重新生成快照".into());
+                }
+                related.insert(key.clone(), path.clone());
+            }
+        }
+    }
+    indexed_fingerprint(&related)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "reads an explicitly selected real session; writes only to a fresh isolated validation directory"]
+    fn real_agent_graph_isolated_roundtrip() {
+        let source = PathBuf::from(
+            std::env::var_os("CODEXUI_VALIDATE_SOURCE_HOME")
+                .expect("set CODEXUI_VALIDATE_SOURCE_HOME"),
+        );
+        let root = std::env::var("CODEXUI_VALIDATE_SESSION").expect("set CODEXUI_VALIDATE_SESSION");
+        let expected_agents: usize = std::env::var("CODEXUI_VALIDATE_AGENTS")
+            .expect("set CODEXUI_VALIDATE_AGENTS")
+            .parse()
+            .unwrap();
+        let base = PathBuf::from(
+            std::env::var_os("CODEXUI_VALIDATE_OUTPUT").expect("set CODEXUI_VALIDATE_OUTPUT"),
+        );
+        fs::create_dir_all(&base).unwrap();
+        let work = base
+            .canonicalize()
+            .unwrap()
+            .join(Uuid::new_v4().to_string());
+        assert!(!work.starts_with(source.canonicalize().unwrap()));
+        let destination = work.join("codex-home");
+        let project = work.join("project");
+        let sync = work.join("export");
+        let journals = work.join("imports");
+        for p in [&destination, &project, &sync, &journals] {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(destination.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
+        println!("VALIDATION_DIR={}", work.display());
+        let package = export_to(&source, &root, &sync, "Agent graph isolated validation").unwrap();
+        let (bundle, files, snapshot) = load_bundle(Path::new(&package)).unwrap();
+        let preview = preview_import_impl(package.clone()).unwrap();
+        assert_eq!(preview.agents, expected_agents);
+        assert_eq!(preview.threads, expected_agents + 1);
+        let original_index = session_index(&source).unwrap();
+        let source_hashes: BTreeMap<_, _> = files
+            .iter()
+            .map(|(key, bytes)| {
+                assert!(
+                    read_limited(&original_index[key]).unwrap() == *bytes,
+                    "source snapshot changed: {key}"
+                );
+                (key.clone(), digest(bytes))
+            })
+            .collect();
+        println!(
+            "EXPORT_OK threads={} agents={} pages={} bytes={}",
+            preview.threads, preview.agents, preview.files, preview.bytes
+        );
+        let result = import_into(
+            package,
+            display_path(&project),
+            snapshot,
+            &destination,
+            &journals,
+        )
+        .unwrap();
+        assert!(result.registered, "{}", result.message);
+        let journal = fs::read_dir(&journals)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(journal.join("receipt.json")).unwrap()).unwrap();
+        let ids: BTreeMap<String, String> = serde_json::from_value(receipt["ids"].clone()).unwrap();
+        let paths: BTreeMap<String, PathBuf> =
+            serde_json::from_value(receipt["paths"].clone()).unwrap();
+        let mut row_count = 0;
+        let mut registration_records = 0;
+        let mut relations = vec![];
+        for (key, bytes) in &files {
+            let original = records(bytes).unwrap();
+            let imported_bytes = fs::read(&paths[key]).unwrap();
+            let imported = records(&imported_bytes).unwrap();
+            assert!(original.len() <= imported.len(), "history truncated: {key}");
+            // Codex can append its own settings event when a thread is resumed.
+            // All original rows must remain an exact transformed prefix.
+            for added in &imported[original.len()..] {
+                assert_eq!(
+                    added["type"], "event_msg",
+                    "unexpected appended record: {key}"
+                );
+                assert_eq!(
+                    added["payload"]["type"], "thread_settings_applied",
+                    "unexpected runtime activity: {key}"
+                );
+                let logical = metadata(bytes).unwrap()["id"].as_str().unwrap().to_string();
+                assert_eq!(added["payload"]["thread_id"], ids[&logical]);
+                registration_records += 1;
+            }
+            for (old, new) in original.iter().zip(&imported) {
+                if old["type"] != "session_meta" && old["type"] != "turn_context" {
+                    let mut expected = old.clone();
+                    if old["type"] != "response_item" {
+                        remap_history_ids(&mut expected["payload"], &ids);
+                    }
+                    assert!(
+                        expected == *new,
+                        "history changed: {key}, ordinal {}",
+                        old["ordinal"]
+                    );
+                } else {
+                    let mut expected = old.clone();
+                    let old_cwd = metadata(bytes).unwrap()["cwd"]
+                        .as_str()
+                        .unwrap()
+                        .to_string();
+                    let is_meta = old["type"] == "session_meta";
+                    remap(
+                        &mut expected["payload"],
+                        &ids,
+                        &old_cwd,
+                        &display_path(&project),
+                        is_meta,
+                    );
+                    if is_meta {
+                        expected["payload"]["cwd"] = json!(display_path(&project));
+                        expected["payload"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("creator_user_id");
+                        expected["payload"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("creator_account_id");
+                        // Offsets are independently checked against the imported page prefix below.
+                        if expected["payload"].get("history_base").is_some() {
+                            let base = old["payload"]["history_base"]["thread_id"]
+                                .as_str()
+                                .unwrap();
+                            let offset = old["payload"]["history_base"]["end_byte_offset"]
+                                .as_u64()
+                                .unwrap() as usize;
+                            let count = files[base][..offset]
+                                .split_inclusive(|b| *b == b'\n')
+                                .count();
+                            let base_bytes = fs::read(&paths[base]).unwrap();
+                            let new_offset: usize = base_bytes
+                                .split_inclusive(|b| *b == b'\n')
+                                .take(count)
+                                .map(<[u8]>::len)
+                                .sum();
+                            expected["payload"]["history_base"]["end_byte_offset"] =
+                                json!(new_offset);
+                        }
+                    }
+                    assert!(
+                        expected == *new,
+                        "metadata mismatch: {key}, ordinal {}",
+                        old["ordinal"]
+                    );
+                }
+                row_count += 1;
+            }
+        }
+        // A fresh app-server process must reopen every logical thread and report its identity/source.
+        let order = registration_order(&bundle, &files).unwrap();
+        let registrations: Vec<_> = order
+            .iter()
+            .map(|thread| Registration {
+                id: ids[thread].clone(),
+                path: display_path(&paths[&bundle.threads[thread]]),
+                cwd: display_path(&project),
+                title: String::new(),
+                resume: agent_parent(&metadata(&files[&bundle.threads[thread]]).unwrap()).is_none(),
+            })
+            .collect();
+        let reopened = register_many(&destination, &registrations).unwrap();
+        let mut unloaded_session_id_fallbacks = 0;
+        for (thread, info) in order.iter().zip(&reopened) {
+            let head = &bundle.threads[thread];
+            let original_meta = metadata(&files[head]).unwrap();
+            if let Some(session) = original_meta["session_id"].as_str() {
+                let persisted_meta = read_metadata(&paths[head]).unwrap();
+                assert_eq!(
+                    persisted_meta["session_id"], ids[session],
+                    "persisted session tree: {thread}"
+                );
+                // Current app-server reports an unloaded child's own ID in this runtime field.
+                // The persisted shared session ID and parent edges are checked separately.
+                assert!(info["sessionId"] == ids[session] || info["sessionId"] == ids[thread]);
+                if info["sessionId"] != ids[session] {
+                    unloaded_session_id_fallbacks += 1;
+                }
+            }
+            if let Some(fork) = original_meta["forked_from_id"].as_str() {
+                assert_eq!(info["forkedFromId"], ids[fork], "persisted fork: {thread}");
+            }
+            if let Some(parent) = agent_parent(&original_meta) {
+                assert_eq!(
+                    info["parentThreadId"], ids[parent],
+                    "persisted parent field: {thread}"
+                );
+                assert_eq!(
+                    info["source"]["subAgent"]["thread_spawn"]["parent_thread_id"], ids[parent],
+                    "persisted parent: {thread}, source={}",
+                    info["source"]
+                );
+                relations.push(json!({"sourceId":thread,"importedId":ids[thread],"parent":ids[parent],"path":original_meta["source"]["subagent"]["thread_spawn"]["agent_path"]}));
+            }
+        }
+        let imported_index = session_index(&destination).unwrap();
+        let (imported_heads, _) = thread_heads(&imported_index).unwrap();
+        for (thread, head) in &bundle.threads {
+            assert_eq!(imported_heads[&ids[thread]], ids[head]);
+        }
+        for (key, hash) in &source_hashes {
+            assert_eq!(
+                digest(&read_limited(&original_index[key]).unwrap()),
+                *hash,
+                "source changed: {key}"
+            );
+        }
+        let report = json!({"status":"PASS","sourceSession":root,"threads":preview.threads,"agents":preview.agents,"historyFiles":preview.files,"historyRecords":row_count,"registrationSettingsRecords":registration_records,"unloadedApiSessionIdFallbacks":unloaded_session_id_fallbacks,"bytes":preview.bytes,"sourceUnchanged":true,"allThreadsReopened":true,"modelTurnsStarted":0,"relations":relations,"sourceHashes":source_hashes,"importedRoot":result.id});
+        fs::write(
+            work.join("report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        println!(
+            "VALIDATION_PASS records={row_count} report={}",
+            work.join("report.json").display()
+        );
+    }
+    fn agent_fixture(home: &Path, id: &str, parent: &str) {
+        let bytes = fixture(home, id, None);
+        let mut rows = records(&bytes).unwrap();
+        rows[0]["payload"]["source"] = json!({"subagent":{"thread_spawn":{
+            "parent_thread_id":parent,"depth":2,"agent_path":"/root/a/b","agent_nickname":"Test"
+        }}});
+        rows[0]["payload"]["forked_from_id"] = json!(parent);
+        rows[0]["payload"]["thread_source"] = json!("subagent");
+        rows[0]["payload"]["multi_agent_version"] = json!("v2");
+        let bytes: Vec<u8> = rows.into_iter().flat_map(line).collect();
+        fs::write(&session_index(home).unwrap()[id], bytes).unwrap();
+    }
+    #[test]
+    fn runtime_links_are_remapped_without_changing_history_text() {
+        let old = Uuid::new_v4().to_string();
+        let new = Uuid::new_v4().to_string();
+        let ids = BTreeMap::from([(old.clone(), new.clone())]);
+        let mut event = json!({"thread_id":old,"item":{"agent_thread_id":old,"senderThreadId":old,"receiverThreadIds":[old]},"text":old,"encrypted_content":old});
+        remap_history_ids(&mut event, &ids);
+        assert_eq!(event["thread_id"], new);
+        assert_eq!(event["item"]["agent_thread_id"], new);
+        assert_eq!(event["item"]["senderThreadId"], new);
+        assert_eq!(event["item"]["receiverThreadIds"][0], new);
+        assert_eq!(event["text"], old);
+        assert_eq!(event["encrypted_content"], old);
+    }
+    #[test]
+    fn legacy_v1_packages_remain_readable() {
+        let home = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let id = Uuid::new_v4().to_string();
+        let bytes = fixture(home.path(), &id, None);
+        let package = PathBuf::from(export_to(home.path(), &id, sync.path(), "v1").unwrap());
+        let (mut bundle, _, _) = load_bundle(&package).unwrap();
+        bundle.version = 1;
+        bundle.threads.clear();
+        let mut manifest = serde_json::to_value(&bundle).unwrap();
+        manifest.as_object_mut().unwrap().remove("threads");
+        manifest["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp");
+        let manifest = serde_json::to_vec(&manifest).unwrap();
+        let snapshot = digest(&manifest);
+        let folder = package.join("snapshots").join(&snapshot);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("bundle.json"), manifest).unwrap();
+        fs::write(
+            folder.join(format!("{id}.jsonl.zst")),
+            zstd::stream::encode_all(bytes.as_slice(), 3).unwrap(),
+        )
+        .unwrap();
+        atomic_write(&package.join("CURRENT"), snapshot.as_bytes()).unwrap();
+        let (bundle, files, _) = load_bundle(&package).unwrap();
+        assert_eq!(bundle.threads, BTreeMap::from([(id.clone(), id.clone())]));
+        assert_eq!(files[&id], bytes);
+    }
+    #[test]
+    fn exports_descendants_and_shared_history_without_unrelated_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let root = Uuid::new_v4().to_string();
+        let child = Uuid::new_v4().to_string();
+        let grandchild = Uuid::new_v4().to_string();
+        let unrelated = Uuid::new_v4().to_string();
+        fixture(home.path(), &root, None);
+        agent_fixture(home.path(), &child, &root);
+        agent_fixture(home.path(), &grandchild, &child);
+        fixture(home.path(), &unrelated, None);
+        let package = export_to(home.path(), &root, sync.path(), "graph").unwrap();
+        let (_, files, _) = load_bundle(Path::new(&package)).unwrap();
+        assert_eq!(
+            files.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([root, child, grandchild])
+        );
+        assert!(!files.contains_key(&unrelated));
+    }
+    #[test]
+    fn paginated_agent_graph_remaps_logical_identity_and_retains_newest_page() {
+        let home = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let root = Uuid::new_v4().to_string();
+        let page = Uuid::new_v4().to_string();
+        let child = Uuid::new_v4().to_string();
+        let first = fixture(home.path(), &root, None);
+        let last = fixture(home.path(), &page, Some((&root, first.len() as u64)));
+        let mut rows = records(&last).unwrap();
+        rows[0]["payload"]["id"] = json!(root);
+        rows[0]["payload"]["session_id"] = json!(root);
+        let old_path = session_index(home.path()).unwrap()[&page].clone();
+        let new_path =
+            old_path.with_file_name(format!("rollout-2026-10-24T12-00-00-{root}_{page}.jsonl"));
+        fs::rename(old_path, &new_path).unwrap();
+        fs::write(
+            &new_path,
+            rows.into_iter().flat_map(line).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        agent_fixture(home.path(), &child, &root);
+        let inherited = records(&fs::read(&new_path).unwrap()).unwrap()[0].clone();
+        OpenOptions::new()
+            .append(true)
+            .open(&session_index(home.path()).unwrap()[&child])
+            .unwrap()
+            .write_all(&line(inherited))
+            .unwrap();
+        let package = export_to(home.path(), &root, sync.path(), "pages").unwrap();
+        let (bundle, files, _) = load_bundle(Path::new(&package)).unwrap();
+        assert_eq!(bundle.threads[&root], page);
+        assert_eq!(files.len(), 3);
+        let ids: BTreeMap<_, _> = files
+            .keys()
+            .map(|id| (id.clone(), Uuid::new_v4().to_string()))
+            .collect();
+        let mut built = BTreeMap::new();
+        for key in files.keys() {
+            rebuild(
+                key,
+                &files,
+                &ids,
+                "/new/project",
+                &mut BTreeSet::new(),
+                &mut built,
+            )
+            .unwrap();
+        }
+        let last_meta = metadata(&built[&page].0).unwrap();
+        let agent_meta = metadata(&built[&child].0).unwrap();
+        assert_eq!(last_meta["id"], ids[&root]);
+        assert_eq!(last_meta["session_id"], ids[&root]);
+        assert_eq!(last_meta["history_base"]["thread_id"], ids[&root]);
+        assert_eq!(
+            last_meta["history_base"]["end_byte_offset"],
+            built[&root].0.len()
+        );
+        assert_eq!(agent_parent(&agent_meta), Some(ids[&root].as_str()));
+        assert_eq!(agent_meta["forked_from_id"], ids[&root]);
+        assert_eq!(
+            agent_meta["source"]["subagent"]["thread_spawn"]["agent_path"],
+            "/root/a/b"
+        );
+        let inherited = records(&built[&child].0).unwrap()[2].clone();
+        assert_eq!(inherited["payload"]["id"], ids[&root]);
+        assert_eq!(
+            inherited["payload"]["history_base"]["thread_id"],
+            ids[&root]
+        );
+        assert_eq!(
+            inherited["payload"]["history_base"]["end_byte_offset"],
+            built[&root].0.len()
+        );
+        assert_eq!(
+            records(&built[&page].0).unwrap()[1],
+            records(&files[&page]).unwrap()[1]
+        );
+        let order = registration_order(&bundle, &files).unwrap();
+        assert!(order.iter().position(|s| s == &root) < order.iter().position(|s| s == &child));
+    }
+    #[test]
+    fn agent_changes_invalidate_sync_but_unrelated_chat_changes_do_not() {
+        let home = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let root = Uuid::new_v4().to_string();
+        let child = Uuid::new_v4().to_string();
+        fixture(home.path(), &root, None);
+        let package = export_to(home.path(), &root, sync.path(), "sync").unwrap();
+        let (bundle, _, _) = load_bundle(Path::new(&package)).unwrap();
+        let before = source_fingerprint(&session_index(home.path()).unwrap(), &bundle).unwrap();
+        fixture(home.path(), &Uuid::new_v4().to_string(), None);
+        assert_eq!(
+            before,
+            source_fingerprint(&session_index(home.path()).unwrap(), &bundle).unwrap()
+        );
+        agent_fixture(home.path(), &child, &root);
+        assert!(source_fingerprint(&session_index(home.path()).unwrap(), &bundle).is_err());
+    }
+    #[test]
+    fn refuses_missing_agent_parent_and_parent_cycles() {
+        let home = tempfile::tempdir().unwrap();
+        let sync = tempfile::tempdir().unwrap();
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        agent_fixture(home.path(), &a, &b);
+        assert!(export_to(home.path(), &a, sync.path(), "missing")
+            .unwrap_err()
+            .contains("缺少"));
+        agent_fixture(home.path(), &b, &a);
+        let package = export_to(home.path(), &a, sync.path(), "cycle").unwrap();
+        assert!(load_bundle(Path::new(&package))
+            .unwrap_err()
+            .contains("循环"));
+    }
     fn line(v: Value) -> Vec<u8> {
         let mut b = serde_json::to_vec(&v).unwrap();
         b.push(b'\n');
